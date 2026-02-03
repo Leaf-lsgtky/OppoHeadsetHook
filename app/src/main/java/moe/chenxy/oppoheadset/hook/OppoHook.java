@@ -378,7 +378,7 @@ public class OppoHook implements IXposedHookLoadPackage {
                         return;
                     }
                 }
-            } catch (ClassNotFoundException ignored) {
+            } catch (Throwable ignored) {
             }
         }
     }
