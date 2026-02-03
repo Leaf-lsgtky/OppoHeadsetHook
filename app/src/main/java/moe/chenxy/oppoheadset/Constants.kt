@@ -4,6 +4,7 @@ package moe.chenxy.oppoheadset
  * OPPO 耳机控制常量定义
  */
 object Constants {
+    const val PKG_NAME_SELF = "moe.chenxy.oppoheadset"
     const val PKG_NAME_HEYTAP = "com.heytap.headset"
     const val PKG_NAME_SYSTEMUI = "com.android.systemui"
 
