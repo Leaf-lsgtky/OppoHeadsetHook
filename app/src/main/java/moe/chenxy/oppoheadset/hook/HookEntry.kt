@@ -10,40 +10,27 @@ import moe.chenxy.oppoheadset.Constants
 /**
  * Xposed 模块入口
  *
- * Hook 以下应用：
- * 1. com.android.systemui - 融合设备中心集成
- * 2. com.android.bluetooth - 监听蓝牙连接状态
- * 3. com.xiaomi.bluetooth - 显示小米风格的通知和 Toast
- * 4. com.heytap.headset - 获取 OPPO 耳机电量和控制降噪
+ * 只 Hook 两个应用：
+ * 1. com.heytap.headset - 获取电量、接收控制指令、执行降噪切换
+ * 2. com.android.systemui - 接收电量、在控制中心显示控制按钮
  */
 class HookEntry : IXposedHookLoadPackage {
 
+    private val heytapHook = HeytapHook()
     private val systemUIHook = SystemUIHook()
-    private val bluetoothHook = BluetoothHook()
-    private val miBluetoothHook = MiBluetoothHook()
-    private val oppoHeadsetHook = OppoHeadsetHook()
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         when (lpparam.packageName) {
             Constants.PKG_NAME_SELF -> {
-                // Hook 自身的 isModuleActive() 方法返回 true
                 hookSelfModuleStatus(lpparam)
             }
-            Constants.PKG_NAME_SYSTEMUI -> {
-                XposedBridge.log("OppoHeadsetHook: Loading hook for ${Constants.PKG_NAME_SYSTEMUI}")
-                systemUIHook.handleLoadPackage(lpparam)
-            }
-            Constants.PKG_NAME_BLUETOOTH -> {
-                XposedBridge.log("OppoHeadsetHook: Loading hook for ${Constants.PKG_NAME_BLUETOOTH}")
-                bluetoothHook.handleLoadPackage(lpparam)
-            }
-            Constants.PKG_NAME_MI_BLUETOOTH -> {
-                XposedBridge.log("OppoHeadsetHook: Loading hook for ${Constants.PKG_NAME_MI_BLUETOOTH}")
-                miBluetoothHook.handleLoadPackage(lpparam)
-            }
             Constants.PKG_NAME_HEYTAP -> {
-                XposedBridge.log("OppoHeadsetHook: Loading hook for ${Constants.PKG_NAME_HEYTAP}")
-                oppoHeadsetHook.handleLoadPackage(lpparam)
+                XposedBridge.log("OppoHeadsetHook: Hooking ${Constants.PKG_NAME_HEYTAP}")
+                heytapHook.handleLoadPackage(lpparam)
+            }
+            Constants.PKG_NAME_SYSTEMUI -> {
+                XposedBridge.log("OppoHeadsetHook: Hooking ${Constants.PKG_NAME_SYSTEMUI}")
+                systemUIHook.handleLoadPackage(lpparam)
             }
         }
     }
@@ -56,9 +43,8 @@ class HookEntry : IXposedHookLoadPackage {
                 "isModuleActive",
                 XC_MethodReplacement.returnConstant(true)
             )
-            XposedBridge.log("OppoHeadsetHook: Module status hook applied")
         } catch (e: Throwable) {
-            XposedBridge.log("OppoHeadsetHook: Failed to hook module status: ${e.message}")
+            XposedBridge.log("OppoHeadsetHook: Failed to hook module status")
         }
     }
 }

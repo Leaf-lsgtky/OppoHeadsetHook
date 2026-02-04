@@ -32,7 +32,7 @@ class MainActivity : Activity() {
 
     private val logReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == Constants.Action.OPPO_LOG) {
+            if (intent?.action == Constants.Action.LOG) {
                 val log = intent.getStringExtra("log") ?: return
                 val time = intent.getLongExtra("time", System.currentTimeMillis())
                 appendLog(log, time)
@@ -81,10 +81,14 @@ class MainActivity : Activity() {
         val hookTargetsView = TextView(this).apply {
             text = """
                 |Hook 目标:
+                |• com.heytap.headset - 获取电量/控制降噪
                 |• com.android.systemui - 融合设备中心
-                |• com.android.bluetooth - 蓝牙连接状态
-                |• com.xiaomi.bluetooth - 小米蓝牙通知
-                |• com.heytap.headset - 欢律 App
+                |
+                |工作流程:
+                |1. 欢律 Hook 获取电量 → 广播给 SystemUI
+                |2. SystemUI 收到电量 → 记录 MAC 地址
+                |3. 用户点击设备卡片 → 发送切换降噪指令
+                |4. 欢律收到指令 → 调用 n0() 切换模式
             """.trimMargin()
             textSize = 12f
             setTextColor(Color.parseColor("#888888"))
@@ -112,9 +116,7 @@ class MainActivity : Activity() {
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#333333"))
             setPadding(24, 8, 24, 8)
-            setOnClickListener {
-                clearLog()
-            }
+            setOnClickListener { clearLog() }
         }
 
         logHeaderLayout.addView(logTitleView)
@@ -124,12 +126,8 @@ class MainActivity : Activity() {
         scrollView = ScrollView(this).apply {
             setBackgroundColor(Color.parseColor("#0D0D0D"))
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-            ).apply {
-                topMargin = 8
-            }
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+            ).apply { topMargin = 8 }
         }
 
         logTextView = TextView(this).apply {
@@ -150,36 +148,16 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
         }
 
-        val openHeyTapButton = Button(this).apply {
-            text = "打开欢律"
+        val testModeButton = Button(this).apply {
+            text = "测试切换降噪"
             textSize = 14f
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#2196F3"))
             setPadding(32, 16, 32, 16)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                marginEnd = 16
-            }
-            setOnClickListener {
-                openHeyTap()
-            }
+            setOnClickListener { sendTestSwitchMode() }
         }
 
-        val testBroadcastButton = Button(this).apply {
-            text = "测试广播"
-            textSize = 14f
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#FF9800"))
-            setPadding(32, 16, 32, 16)
-            setOnClickListener {
-                sendTestBroadcast()
-            }
-        }
-
-        buttonLayout.addView(openHeyTapButton)
-        buttonLayout.addView(testBroadcastButton)
+        buttonLayout.addView(testModeButton)
 
         // 添加所有视图
         mainLayout.addView(titleView)
@@ -192,15 +170,13 @@ class MainActivity : Activity() {
 
         setContentView(mainLayout)
 
-        // 添加初始日志
         appendLog("[App] MainActivity 已启动", System.currentTimeMillis())
         appendLog("[App] 模块状态: ${if (isModuleActive()) "已激活" else "未激活"}", System.currentTimeMillis())
     }
 
     override fun onResume() {
         super.onResume()
-        // 注册日志接收器
-        val filter = IntentFilter(Constants.Action.OPPO_LOG)
+        val filter = IntentFilter(Constants.Action.LOG)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(logReceiver, filter, RECEIVER_EXPORTED)
         } else {
@@ -211,11 +187,7 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         super.onPause()
-        try {
-            unregisterReceiver(logReceiver)
-        } catch (e: Exception) {
-            // 忽略
-        }
+        try { unregisterReceiver(logReceiver) } catch (_: Exception) {}
     }
 
     private fun appendLog(message: String, timestamp: Long) {
@@ -224,7 +196,6 @@ class MainActivity : Activity() {
             val logLine = "[$timeStr] $message\n"
             logBuffer.append(logLine)
 
-            // 限制日志行数
             val lines = logBuffer.lines()
             if (lines.size > maxLogLines) {
                 logBuffer.clear()
@@ -232,11 +203,7 @@ class MainActivity : Activity() {
             }
 
             logTextView.text = logBuffer.toString()
-
-            // 滚动到底部
-            scrollView.post {
-                scrollView.fullScroll(ScrollView.FOCUS_DOWN)
-            }
+            scrollView.post { scrollView.fullScroll(ScrollView.FOCUS_DOWN) }
         }
     }
 
@@ -245,38 +212,19 @@ class MainActivity : Activity() {
         logTextView.text = "日志已清空\n"
     }
 
-    private fun openHeyTap() {
-        try {
-            val intent = packageManager.getLaunchIntentForPackage(Constants.PKG_NAME_HEYTAP)
-            if (intent != null) {
-                startActivity(intent)
-                appendLog("[App] 正在打开欢律 App", System.currentTimeMillis())
-            } else {
-                appendLog("[App] 未找到欢律 App", System.currentTimeMillis())
-            }
-        } catch (e: Exception) {
-            appendLog("[App] 打开欢律失败: ${e.message}", System.currentTimeMillis())
-        }
-    }
+    private fun sendTestSwitchMode() {
+        appendLog("[App] 发送测试切换降噪指令 (mode=1 通透)", System.currentTimeMillis())
 
-    private fun sendTestBroadcast() {
-        appendLog("[App] 发送测试广播...", System.currentTimeMillis())
-
-        // 发送测试电量广播
-        Intent(Constants.Action.OPPO_BATTERY_UPDATE).apply {
-            putExtra("left", 85)
-            putExtra("right", 90)
-            putExtra("box", 100)
-            putExtra("mac", "AA:BB:CC:DD:EE:FF")
-            putExtra("name", "Test OPPO Headset")
+        Intent(Constants.Action.SWITCH_MODE).apply {
+            putExtra("mode", Constants.AncMode.TRANSPARENCY)
             sendBroadcast(this)
         }
 
-        appendLog("[App] 测试广播已发送 (L=85 R=90 B=100)", System.currentTimeMillis())
+        appendLog("[App] 广播已发送", System.currentTimeMillis())
     }
 
-    private fun isModuleActive(): Boolean {
-        // 如果模块被 Xposed 加载，这个方法会被 Hook 返回 true
+    fun isModuleActive(): Boolean {
+        // Hook 后会返回 true
         return false
     }
 }
