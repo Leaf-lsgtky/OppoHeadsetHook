@@ -16,6 +16,8 @@ object Constants {
         const val OPPO_ACTION_SWITCH_MODE = "com.xiaomi.controlcenter.OPPO_ACTION_SWITCH_MODE"
         // 连接状态变更
         const val OPPO_CONNECTION_STATE = "com.xiaomi.controlcenter.OPPO_CONNECTION_STATE"
+        // 设备卡片被点击
+        const val OPPO_DEVICE_CLICKED = "com.xiaomi.controlcenter.OPPO_DEVICE_CLICKED"
     }
 
     // 降噪模式

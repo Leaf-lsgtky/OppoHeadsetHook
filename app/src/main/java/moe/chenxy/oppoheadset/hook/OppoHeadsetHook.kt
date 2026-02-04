@@ -61,24 +61,66 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
 
     /**
      * Hook Application.onCreate 以获取 Context
+     * 注意：只 hook 特定的 Application 类以避免重复触发
      */
     private fun hookApplicationOnCreate(lpparam: XC_LoadPackage.LoadPackageParam) {
         try {
-            XposedHelpers.findAndHookMethod(
-                "android.app.Application",
-                lpparam.classLoader,
-                "onCreate",
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val app = param.thisObject as Context
-                        appContext = app
-                        Log.i(TAG, "Application context obtained")
-
-                        // 注册广播接收器监听 SystemUI 的控制指令
-                        registerControlReceiver(app)
-                    }
-                }
+            // 尝试 hook 欢律 App 的 Application 类
+            val appClassNames = listOf(
+                "com.heytap.headset.MelodyApplication",
+                "com.oplus.melody.MelodyApplication"
             )
+
+            var hooked = false
+            for (className in appClassNames) {
+                try {
+                    XposedHelpers.findAndHookMethod(
+                        className,
+                        lpparam.classLoader,
+                        "onCreate",
+                        object : XC_MethodHook() {
+                            override fun afterHookedMethod(param: MethodHookParam) {
+                                val app = param.thisObject as Context
+                                if (appContext == null) {
+                                    appContext = app
+                                    Log.i(TAG, "Application context obtained from $className")
+                                    registerControlReceiver(app)
+                                }
+                            }
+                        }
+                    )
+                    hooked = true
+                    Log.i(TAG, "Hooked $className.onCreate")
+                    break
+                } catch (e: ClassNotFoundException) {
+                    continue
+                }
+            }
+
+            // 如果特定类不存在，使用通用 Application hook
+            if (!hooked) {
+                XposedHelpers.findAndHookMethod(
+                    "android.app.Application",
+                    lpparam.classLoader,
+                    "onCreate",
+                    object : XC_MethodHook() {
+                        private var contextObtained = false
+
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            if (contextObtained) return
+
+                            val app = param.thisObject as Context
+                            // 检查包名确保是正确的应用
+                            if (app.packageName == Constants.PKG_NAME_HEYTAP) {
+                                appContext = app
+                                contextObtained = true
+                                Log.i(TAG, "Application context obtained")
+                                registerControlReceiver(app)
+                            }
+                        }
+                    }
+                )
+            }
         } catch (e: Throwable) {
             XposedBridge.log("$TAG: Failed to hook Application.onCreate: ${e.message}")
         }
