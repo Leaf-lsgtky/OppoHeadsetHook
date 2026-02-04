@@ -4,5 +4,7 @@
         <item>moe.chenxy.oppoheadset</item>
         <item>com.heytap.headset</item>
         <item>com.android.systemui</item>
+        <item>com.android.bluetooth</item>
+        <item>com.xiaomi.bluetooth</item>
     </string-array>
 </resources>

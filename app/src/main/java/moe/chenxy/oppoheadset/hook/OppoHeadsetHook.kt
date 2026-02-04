@@ -1,5 +1,6 @@
 package moe.chenxy.oppoheadset.hook
 
+import android.bluetooth.BluetoothDevice
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -21,17 +22,23 @@ import moe.chenxy.oppoheadset.Constants
  *
  * 功能:
  * 1. Hook KeepAliveFgService.d 方法获取电量和 MAC 地址
- * 2. 接收 SystemUI 控制指令，反射调用 AbstractC0772b 切换降噪模式
- * 3. 通过广播向 SystemUI 发送电量信息
+ * 2. 接收 SystemUI 控制指令，反射调用控制中心切换降噪模式
+ * 3. 通过广播向 SystemUI 和小米蓝牙发送电量信息
  */
 class OppoHeadsetHook : IXposedHookLoadPackage {
 
     companion object {
         private const val TAG = "OppoHeadsetHook"
 
-        // 保存当前连接的 MAC 地址
+        // 当前连接的设备信息
         @Volatile
         var currentMacAddress: String = ""
+
+        @Volatile
+        var currentDeviceName: String = ""
+
+        @Volatile
+        var currentDevice: BluetoothDevice? = null
 
         // 控制中心单例实例
         @Volatile
@@ -40,6 +47,11 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
         // 应用 Context
         @Volatile
         var appContext: Context? = null
+
+        // 上次发送的电量（避免重复发送）
+        private var lastLeftBattery = -1
+        private var lastRightBattery = -1
+        private var lastBoxBattery = -1
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -48,6 +60,7 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
         }
 
         Log.i(TAG, "Hooking ${Constants.PKG_NAME_HEYTAP}")
+        sendLog("开始 Hook 欢律 App")
 
         // Hook Application.onCreate 以获取 Context 并注册广播接收器
         hookApplicationOnCreate(lpparam)
@@ -61,14 +74,14 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
 
     /**
      * Hook Application.onCreate 以获取 Context
-     * 注意：只 hook 特定的 Application 类以避免重复触发
      */
     private fun hookApplicationOnCreate(lpparam: XC_LoadPackage.LoadPackageParam) {
         try {
             // 尝试 hook 欢律 App 的 Application 类
             val appClassNames = listOf(
                 "com.heytap.headset.MelodyApplication",
-                "com.oplus.melody.MelodyApplication"
+                "com.oplus.melody.MelodyApplication",
+                "com.heytap.headset.app.HeadsetApplication"
             )
 
             var hooked = false
@@ -84,6 +97,7 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
                                 if (appContext == null) {
                                     appContext = app
                                     Log.i(TAG, "Application context obtained from $className")
+                                    sendLog("获取到欢律 Context")
                                     registerControlReceiver(app)
                                 }
                             }
@@ -91,8 +105,9 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
                     )
                     hooked = true
                     Log.i(TAG, "Hooked $className.onCreate")
+                    sendLog("成功 Hook $className")
                     break
-                } catch (e: ClassNotFoundException) {
+                } catch (e: Throwable) {
                     continue
                 }
             }
@@ -110,11 +125,11 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
                             if (contextObtained) return
 
                             val app = param.thisObject as Context
-                            // 检查包名确保是正确的应用
                             if (app.packageName == Constants.PKG_NAME_HEYTAP) {
                                 appContext = app
                                 contextObtained = true
-                                Log.i(TAG, "Application context obtained")
+                                Log.i(TAG, "Application context obtained (fallback)")
+                                sendLog("获取到欢律 Context (fallback)")
                                 registerControlReceiver(app)
                             }
                         }
@@ -127,7 +142,7 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
     }
 
     /**
-     * 注册广播接收器，接收 SystemUI 发来的控制指令
+     * 注册广播接收器，接收控制指令
      */
     private fun registerControlReceiver(context: Context) {
         val handlerThread = HandlerThread("oppo_headset_receiver").apply { start() }
@@ -135,12 +150,13 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
 
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context?, intent: Intent?) {
-                if (intent?.action == Constants.Action.OPPO_ACTION_SWITCH_MODE) {
-                    val mode = intent.getIntExtra("mode", Constants.AncMode.OFF)
-                    Log.i(TAG, "Received control command: switch mode to $mode")
-
-                    // 执行降噪模式切换
-                    switchAncMode(mode)
+                when (intent?.action) {
+                    Constants.Action.OPPO_ACTION_SWITCH_MODE -> {
+                        val mode = intent.getIntExtra("mode", Constants.AncMode.OFF)
+                        Log.i(TAG, "Received control command: switch mode to $mode")
+                        sendLog("收到控制命令: 切换模式到 $mode")
+                        switchAncMode(mode)
+                    }
                 }
             }
         }
@@ -153,6 +169,7 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
         }
 
         Log.i(TAG, "Control receiver registered")
+        sendLog("控制接收器已注册")
     }
 
     /**
@@ -165,50 +182,7 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
                 lpparam.classLoader
             )
 
-            // 由于数据模型类是混淆的，使用 Object.class 作为参数类型
-            XposedHelpers.findAndHookMethod(
-                serviceClass,
-                "d",
-                RemoteViews::class.java,
-                Object::class.java,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val dataModel = param.args[1] ?: return
-
-                        try {
-                            // 通过反射获取数据
-                            val batteryData = extractBatteryData(dataModel)
-
-                            if (batteryData != null) {
-                                // 发送广播给 SystemUI
-                                sendBatteryUpdateBroadcast(batteryData)
-                            }
-                        } catch (e: Throwable) {
-                            XposedBridge.log("$TAG: Error extracting battery data: ${e.message}")
-                        }
-                    }
-                }
-            )
-
-            Log.i(TAG, "KeepAliveFgService.d hooked successfully")
-        } catch (e: Throwable) {
-            XposedBridge.log("$TAG: Failed to hook KeepAliveFgService.d: ${e.message}")
-            // 尝试其他方式 Hook（处理方法签名可能不同的情况）
-            tryAlternativeHook(lpparam)
-        }
-    }
-
-    /**
-     * 备用 Hook 方案 - 遍历所有名为 d 的方法
-     */
-    private fun tryAlternativeHook(lpparam: XC_LoadPackage.LoadPackageParam) {
-        try {
-            val serviceClass = XposedHelpers.findClass(
-                Constants.HookTarget.KEEP_ALIVE_SERVICE,
-                lpparam.classLoader
-            )
-
-            // 遍历所有方法，找到参数为 RemoteViews 和 Object 的方法
+            // 遍历所有名为 d 的方法，找到处理电量的方法
             for (method in serviceClass.declaredMethods) {
                 if (method.name == "d" && method.parameterTypes.size == 2) {
                     val firstParam = method.parameterTypes[0]
@@ -222,21 +196,68 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
                                 try {
                                     val batteryData = extractBatteryData(dataModel)
                                     if (batteryData != null) {
-                                        sendBatteryUpdateBroadcast(batteryData)
+                                        // 检查是否有变化，避免重复发送
+                                        if (batteryData.leftBattery != lastLeftBattery ||
+                                            batteryData.rightBattery != lastRightBattery ||
+                                            batteryData.boxBattery != lastBoxBattery) {
+
+                                            lastLeftBattery = batteryData.leftBattery
+                                            lastRightBattery = batteryData.rightBattery
+                                            lastBoxBattery = batteryData.boxBattery
+
+                                            // 发送广播
+                                            sendBatteryBroadcasts(batteryData)
+                                        }
                                     }
                                 } catch (e: Throwable) {
-                                    XposedBridge.log("$TAG: Error in alternative hook: ${e.message}")
+                                    XposedBridge.log("$TAG: Error extracting battery data: ${e.message}")
                                 }
                             }
                         })
 
-                        Log.i(TAG, "Alternative hook applied to method: ${method.name}")
-                        break
+                        Log.i(TAG, "KeepAliveFgService.d hooked")
+                        sendLog("成功 Hook KeepAliveFgService.d")
+                        return
                     }
                 }
             }
+
+            // 如果没有找到合适的方法，尝试直接 hook
+            XposedHelpers.findAndHookMethod(
+                serviceClass,
+                "d",
+                RemoteViews::class.java,
+                Object::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val dataModel = param.args[1] ?: return
+
+                        try {
+                            val batteryData = extractBatteryData(dataModel)
+                            if (batteryData != null) {
+                                if (batteryData.leftBattery != lastLeftBattery ||
+                                    batteryData.rightBattery != lastRightBattery ||
+                                    batteryData.boxBattery != lastBoxBattery) {
+
+                                    lastLeftBattery = batteryData.leftBattery
+                                    lastRightBattery = batteryData.rightBattery
+                                    lastBoxBattery = batteryData.boxBattery
+
+                                    sendBatteryBroadcasts(batteryData)
+                                }
+                            }
+                        } catch (e: Throwable) {
+                            XposedBridge.log("$TAG: Error in battery hook: ${e.message}")
+                        }
+                    }
+                }
+            )
+
+            Log.i(TAG, "KeepAliveFgService.d hooked (direct)")
+            sendLog("成功 Hook KeepAliveFgService.d (direct)")
         } catch (e: Throwable) {
-            XposedBridge.log("$TAG: Alternative hook also failed: ${e.message}")
+            XposedBridge.log("$TAG: Failed to hook KeepAliveFgService.d: ${e.message}")
+            sendLog("Hook KeepAliveFgService 失败: ${e.message}")
         }
     }
 
@@ -245,30 +266,45 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
      */
     private fun extractBatteryData(dataModel: Any): BatteryData? {
         return try {
-            val clazz = dataModel.javaClass
-
             // 获取 MAC 地址
             val macAddress = tryInvokeMethod(dataModel, "getAddress") as? String ?: ""
             if (macAddress.isNotEmpty()) {
                 currentMacAddress = macAddress
             }
 
+            // 获取设备名称
+            val deviceName = tryInvokeMethod(dataModel, "getDeviceName") as? String
+                ?: tryInvokeMethod(dataModel, "getName") as? String ?: ""
+            if (deviceName.isNotEmpty()) {
+                currentDeviceName = deviceName
+            }
+
             // 判断连接类型
             val isSpp = tryInvokeMethod(dataModel, "isSpp") as? Boolean ?: false
 
             // 获取电量 - 尝试多种方法名
-            val leftBattery = tryGetBattery(dataModel, "getLeftBattery", "getHeadsetLeftBattery")
-            val rightBattery = tryGetBattery(dataModel, "getRightBattery", "getHeadsetRightBattery")
-            val boxBattery = tryGetBattery(dataModel, "getBoxBattery", "getHeadsetBoxBattery")
+            val leftBattery = tryGetBattery(dataModel, "getLeftBattery", "getHeadsetLeftBattery", "getLeftPower")
+            val rightBattery = tryGetBattery(dataModel, "getRightBattery", "getHeadsetRightBattery", "getRightPower")
+            val boxBattery = tryGetBattery(dataModel, "getBoxBattery", "getHeadsetBoxBattery", "getCasePower")
 
-            Log.d(TAG, "Battery data: left=$leftBattery, right=$rightBattery, box=$boxBattery, mac=$macAddress")
+            // 获取充电状态
+            val leftCharging = tryInvokeMethod(dataModel, "isLeftCharging") as? Boolean ?: false
+            val rightCharging = tryInvokeMethod(dataModel, "isRightCharging") as? Boolean ?: false
+            val boxCharging = tryInvokeMethod(dataModel, "isBoxCharging") as? Boolean
+                ?: tryInvokeMethod(dataModel, "isCaseCharging") as? Boolean ?: false
+
+            Log.d(TAG, "Battery data: L=$leftBattery R=$rightBattery B=$boxBattery MAC=$currentMacAddress")
 
             BatteryData(
                 leftBattery = leftBattery,
                 rightBattery = rightBattery,
                 boxBattery = boxBattery,
                 macAddress = currentMacAddress,
-                isSpp = isSpp
+                deviceName = currentDeviceName,
+                isSpp = isSpp,
+                leftCharging = leftCharging,
+                rightCharging = rightCharging,
+                boxCharging = boxCharging
             )
         } catch (e: Throwable) {
             XposedBridge.log("$TAG: extractBatteryData error: ${e.message}")
@@ -298,7 +334,6 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
             method.isAccessible = true
             method.invoke(obj)
         } catch (e: NoSuchMethodException) {
-            // 尝试 getDeclaredMethod
             try {
                 val method = obj.javaClass.getDeclaredMethod(methodName)
                 method.isAccessible = true
@@ -312,24 +347,59 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
     }
 
     /**
-     * 发送电量更新广播给 SystemUI
+     * 发送电量广播给 SystemUI 和小米蓝牙
      */
-    private fun sendBatteryUpdateBroadcast(data: BatteryData) {
+    private fun sendBatteryBroadcasts(data: BatteryData) {
         val context = appContext ?: return
 
+        sendLog("发送电量广播: L=${data.leftBattery} R=${data.rightBattery} B=${data.boxBattery}")
+
+        // 发送给 SystemUI
         Intent(Constants.Action.OPPO_BATTERY_UPDATE).apply {
             putExtra("left", data.leftBattery)
             putExtra("right", data.rightBattery)
             putExtra("box", data.boxBattery)
             putExtra("mac", data.macAddress)
+            putExtra("name", data.deviceName)
             putExtra("isSpp", data.isSpp)
+            putExtra("leftCharging", data.leftCharging)
+            putExtra("rightCharging", data.rightCharging)
+            putExtra("boxCharging", data.boxCharging)
             addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
-            // 发送给 SystemUI
-            `package` = Constants.PKG_NAME_SYSTEMUI
             context.sendBroadcast(this)
         }
 
-        Log.d(TAG, "Battery broadcast sent: $data")
+        // 发送给小米蓝牙显示通知
+        Intent(Constants.Action.OPPO_UPDATE_NOTIFICATION).apply {
+            putExtra("left", data.leftBattery)
+            putExtra("right", data.rightBattery)
+            putExtra("box", data.boxBattery)
+            putExtra("leftCharging", data.leftCharging)
+            putExtra("rightCharging", data.rightCharging)
+            putExtra("boxCharging", data.boxCharging)
+            putExtra("name", data.deviceName)
+            // 需要传递 BluetoothDevice，但我们可能没有直接的引用
+            // 使用 MAC 地址代替
+            putExtra("mac", data.macAddress)
+            `package` = Constants.PKG_NAME_MI_BLUETOOTH
+            addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
+            context.sendBroadcast(this)
+        }
+
+        // 显示 Strong Toast（首次连接时）
+        if (lastLeftBattery == -1 && lastRightBattery == -1) {
+            Intent(Constants.Action.OPPO_SHOW_STRONG_TOAST).apply {
+                putExtra("left", data.leftBattery)
+                putExtra("right", data.rightBattery)
+                putExtra("box", data.boxBattery)
+                putExtra("name", data.deviceName)
+                `package` = Constants.PKG_NAME_MI_BLUETOOTH
+                addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
+                context.sendBroadcast(this)
+            }
+        }
+
+        Log.d(TAG, "Battery broadcasts sent")
     }
 
     /**
@@ -355,9 +425,9 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
             )
 
             Log.i(TAG, "Control center singleton hooked")
+            sendLog("成功 Hook 控制中心单例")
         } catch (e: Throwable) {
             XposedBridge.log("$TAG: Failed to hook control center singleton: ${e.message}")
-            // 尝试查找实际类名（可能是混淆后的类）
             tryFindControlCenterClass(lpparam)
         }
     }
@@ -367,10 +437,9 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
      */
     private fun tryFindControlCenterClass(lpparam: XC_LoadPackage.LoadPackageParam) {
         try {
-            // 尝试常见的混淆模式
             val possibleClassNames = listOf(
                 "com.oplus.melody.model.repository.earphone.AbstractC0772b",
-                "l4.b",  // 可能的混淆名
+                "l4.b",
                 "com.oplus.melody.model.repository.earphone.b"
             )
 
@@ -378,7 +447,6 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
                 try {
                     val clazz = XposedHelpers.findClass(className, lpparam.classLoader)
 
-                    // 查找获取单例的静态方法
                     for (method in clazz.declaredMethods) {
                         if (java.lang.reflect.Modifier.isStatic(method.modifiers) &&
                             method.parameterTypes.isEmpty() &&
@@ -392,6 +460,7 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
                             })
 
                             Log.i(TAG, "Found control center class: $className")
+                            sendLog("找到控制中心类: $className")
                             return
                         }
                     }
@@ -410,26 +479,24 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
     private fun switchAncMode(mode: Int) {
         val instance = controlCenterInstance
         if (instance == null) {
-            Log.w(TAG, "Control center instance is null, trying to get it")
-            // 尝试重新获取单例
+            Log.w(TAG, "Control center instance is null")
+            sendLog("控制中心实例为空")
             tryGetControlCenterInstance()
             return
         }
 
         if (currentMacAddress.isEmpty()) {
-            Log.w(TAG, "MAC address is empty, cannot switch mode")
+            Log.w(TAG, "MAC address is empty")
+            sendLog("MAC 地址为空")
             return
         }
 
         try {
-            // 调用 n0(int mode, String macAddress) 方法
             val clazz = instance.javaClass
 
-            // 尝试找到 n0 方法
             val method = try {
                 clazz.getMethod("n0", Int::class.javaPrimitiveType, String::class.java)
             } catch (e: NoSuchMethodException) {
-                // 尝试其他可能的方法名
                 clazz.declaredMethods.find { m ->
                     m.parameterTypes.size == 2 &&
                     m.parameterTypes[0] == Int::class.javaPrimitiveType &&
@@ -440,12 +507,15 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
             if (method != null) {
                 method.isAccessible = true
                 method.invoke(instance, mode, currentMacAddress)
-                Log.i(TAG, "ANC mode switched to $mode for device $currentMacAddress")
+                Log.i(TAG, "ANC mode switched to $mode")
+                sendLog("降噪模式已切换到 $mode")
             } else {
                 XposedBridge.log("$TAG: Cannot find method to switch ANC mode")
+                sendLog("找不到切换降噪模式的方法")
             }
         } catch (e: Throwable) {
             XposedBridge.log("$TAG: Error switching ANC mode: ${e.message}")
+            sendLog("切换降噪模式失败: ${e.message}")
         }
     }
 
@@ -466,7 +536,6 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
                 try {
                     val clazz = XposedHelpers.findClass(className, classLoader)
 
-                    // 尝试调用 H() 方法
                     try {
                         val hMethod = clazz.getMethod("H")
                         controlCenterInstance = hMethod.invoke(null)
@@ -475,7 +544,6 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
                             return
                         }
                     } catch (e: NoSuchMethodException) {
-                        // 查找其他可能的单例获取方法
                         for (method in clazz.declaredMethods) {
                             if (java.lang.reflect.Modifier.isStatic(method.modifiers) &&
                                 method.parameterTypes.isEmpty() &&
@@ -500,6 +568,22 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
     }
 
     /**
+     * 发送日志到主界面
+     */
+    private fun sendLog(message: String) {
+        try {
+            val context = appContext ?: return
+            Intent(Constants.Action.OPPO_LOG).apply {
+                putExtra("log", "[HeyTap] $message")
+                putExtra("time", System.currentTimeMillis())
+                context.sendBroadcast(this)
+            }
+        } catch (e: Throwable) {
+            // 忽略
+        }
+    }
+
+    /**
      * 电量数据类
      */
     data class BatteryData(
@@ -507,6 +591,10 @@ class OppoHeadsetHook : IXposedHookLoadPackage {
         val rightBattery: Int,
         val boxBattery: Int,
         val macAddress: String,
-        val isSpp: Boolean
+        val deviceName: String,
+        val isSpp: Boolean,
+        val leftCharging: Boolean = false,
+        val rightCharging: Boolean = false,
+        val boxCharging: Boolean = false
     )
 }

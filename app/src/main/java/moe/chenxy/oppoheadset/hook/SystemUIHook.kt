@@ -18,10 +18,12 @@ import moe.chenxy.oppoheadset.Constants
 /**
  * SystemUI Hook - 在小米控制中心集成 OPPO 耳机控制
  *
- * 工作原理：
+ * 参考 HyperPods 的 SystemUIPluginHook 和 DeviceCardHook 实现
+ *
+ * 功能：
  * 1. Hook PluginInstance.loadPlugin() 获取 miui.systemui.plugin 的 ClassLoader
  * 2. 使用该 ClassLoader hook DeviceInfoWrapper.performClicked 拦截设备卡片点击
- * 3. 注册广播接收器接收欢律 App 发来的电量数据
+ * 3. 注册广播接收器接收电量数据
  */
 class SystemUIHook : IXposedHookLoadPackage {
 
@@ -42,6 +44,9 @@ class SystemUIHook : IXposedHookLoadPackage {
         var macAddress: String = ""
 
         @Volatile
+        var deviceName: String = ""
+
+        @Volatile
         var isOppoHeadsetConnected: Boolean = false
 
         // SystemUI Context
@@ -52,19 +57,18 @@ class SystemUIHook : IXposedHookLoadPackage {
         @Volatile
         private var pluginClassLoader: ClassLoader? = null
 
-        // 电量更新回调
-        var onBatteryUpdate: ((left: Int, right: Int, box: Int, mac: String) -> Unit)? = null
+        // MainPanelController 实例
+        @Volatile
+        private var panelController: Any? = null
     }
-
-    private var lpparam: XC_LoadPackage.LoadPackageParam? = null
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != Constants.PKG_NAME_SYSTEMUI) {
             return
         }
 
-        this.lpparam = lpparam
         Log.i(TAG, "Hooking ${Constants.PKG_NAME_SYSTEMUI}")
+        sendLog("开始 Hook SystemUI")
 
         // Hook SystemUI 启动，注册广播接收器
         hookSystemUIInit(lpparam)
@@ -87,9 +91,10 @@ class SystemUIHook : IXposedHookLoadPackage {
                         val app = param.thisObject as Context
                         systemUIContext = app
                         Log.i(TAG, "SystemUI context obtained")
+                        sendLog("获取到 SystemUI Context")
 
                         // 注册广播接收器
-                        registerBatteryReceiver(app)
+                        registerReceivers(app)
                     }
                 }
             )
@@ -100,7 +105,6 @@ class SystemUIHook : IXposedHookLoadPackage {
 
     /**
      * Hook Plugin 加载器获取 miui.systemui.plugin 的 ClassLoader
-     * 参考 HyperPods 的实现
      */
     private fun hookPluginLoader(lpparam: XC_LoadPackage.LoadPackageParam) {
         try {
@@ -123,8 +127,8 @@ class SystemUIHook : IXposedHookLoadPackage {
 
                                 if (pluginClassLoader != clsLoader) {
                                     Log.i(TAG, "Got miui.systemui.plugin ClassLoader")
+                                    sendLog("获取到 Plugin ClassLoader")
                                     pluginClassLoader = clsLoader
-                                    // 初始化 Plugin Hook
                                     initPluginHook(clsLoader)
                                 }
                             }
@@ -136,83 +140,70 @@ class SystemUIHook : IXposedHookLoadPackage {
             )
 
             Log.i(TAG, "PluginInstance.loadPlugin hooked")
+            sendLog("成功 Hook PluginInstance")
         } catch (e: Throwable) {
             XposedBridge.log("$TAG: Failed to hook PluginInstance: ${e.message}")
-            // 可能是旧版本 SystemUI，尝试其他方式
-            tryAlternativePluginHook(lpparam)
-        }
-    }
-
-    /**
-     * 备用 Plugin Hook 方案（适用于旧版本）
-     */
-    private fun tryAlternativePluginHook(lpparam: XC_LoadPackage.LoadPackageParam) {
-        try {
-            // 尝试 Hook PluginManagerImpl
-            val pluginManagerClass = XposedHelpers.findClass(
-                "com.android.systemui.shared.plugins.PluginManagerImpl",
-                lpparam.classLoader
-            )
-
-            for (method in pluginManagerClass.declaredMethods) {
-                if (method.name == "onPluginLoaded" || method.name == "handleLoadPlugin") {
-                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                        override fun afterHookedMethod(param: MethodHookParam) {
-                            try {
-                                // 尝试从参数中获取 ClassLoader
-                                for (arg in param.args) {
-                                    if (arg is ClassLoader) {
-                                        tryInitPluginHookWithClassLoader(arg)
-                                    }
-                                }
-                            } catch (e: Throwable) {
-                                // 忽略错误
-                            }
-                        }
-                    })
-                    Log.i(TAG, "Alternative plugin hook applied: ${method.name}")
-                }
-            }
-        } catch (e: Throwable) {
-            XposedBridge.log("$TAG: Alternative plugin hook also failed: ${e.message}")
-        }
-    }
-
-    /**
-     * 尝试使用给定的 ClassLoader 初始化 Plugin Hook
-     */
-    private fun tryInitPluginHookWithClassLoader(classLoader: ClassLoader) {
-        try {
-            // 检查是否是 miui.systemui.plugin 的 ClassLoader
-            val testClass = classLoader.loadClass("miui.systemui.devicecenter.devices.DeviceInfoWrapper")
-            if (testClass != null && pluginClassLoader != classLoader) {
-                Log.i(TAG, "Found miui.systemui.plugin ClassLoader via alternative method")
-                pluginClassLoader = classLoader
-                initPluginHook(classLoader)
-            }
-        } catch (e: ClassNotFoundException) {
-            // 不是正确的 ClassLoader，忽略
+            sendLog("Hook PluginInstance 失败: ${e.message}")
         }
     }
 
     /**
      * 初始化 Plugin Hook
-     * 使用 plugin ClassLoader hook DeviceInfoWrapper
      */
     private fun initPluginHook(classLoader: ClassLoader) {
         try {
+            // Hook MainPanelController 获取实例
+            hookMainPanelController(classLoader)
+
+            // Hook DeviceInfoWrapper
             hookDeviceInfoWrapper(classLoader)
+
             Log.i(TAG, "Plugin hooks initialized")
+            sendLog("Plugin Hook 初始化完成")
         } catch (e: Throwable) {
             XposedBridge.log("$TAG: Failed to initialize plugin hooks: ${e.message}")
         }
     }
 
     /**
+     * Hook MainPanelController 获取实例用于隐藏控制中心
+     */
+    private fun hookMainPanelController(classLoader: ClassLoader) {
+        try {
+            val panelControllerClass = classLoader.loadClass(
+                "miui.systemui.controlcenter.panel.main.MainPanelController"
+            )
+
+            XposedHelpers.findAndHookMethod(
+                panelControllerClass,
+                "onCreate",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        panelController = param.thisObject
+                        Log.d(TAG, "MainPanelController instance obtained")
+                    }
+                }
+            )
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG: Failed to hook MainPanelController: ${e.message}")
+        }
+    }
+
+    /**
+     * 隐藏控制中心面板
+     */
+    private fun hidePanel() {
+        try {
+            panelController?.let {
+                XposedHelpers.callMethod(it, "exitOrHide")
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Failed to hide panel: ${e.message}")
+        }
+    }
+
+    /**
      * Hook DeviceInfoWrapper.performClicked
-     * 拦截设备卡片点击事件
-     *
-     * 注意：这个 hook 必须非常小心，不能影响原有的设备卡片显示
      */
     private fun hookDeviceInfoWrapper(classLoader: ClassLoader) {
         try {
@@ -227,7 +218,6 @@ class SystemUIHook : IXposedHookLoadPackage {
                 Context::class.java,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        // 使用 try-catch 确保不会影响原有功能
                         try {
                             val context = param.args[0] as? Context ?: return
                             val deviceInfo = XposedHelpers.callMethod(param.thisObject, "getDeviceInfo") ?: return
@@ -241,124 +231,141 @@ class SystemUIHook : IXposedHookLoadPackage {
                                 return
                             }
 
-                            // 只有当我们正在跟踪 OPPO 耳机且 MAC 地址匹配时才拦截
+                            // 检查是否是我们跟踪的 OPPO 耳机
                             if (!isOppoHeadsetConnected || macAddress.isEmpty()) {
-                                Log.d(TAG, "OPPO headset not tracked, letting default behavior")
                                 return
                             }
 
-                            // 检查设备 ID 是否与我们跟踪的 MAC 地址匹配
-                            if (deviceId.equals(macAddress, ignoreCase = true)) {
-                                Log.i(TAG, "OPPO headset clicked, attempting to open control UI")
+                            // 请求 MAC 地址确认
+                            requestMacConfirmation(context)
 
-                                // 尝试打开欢律 App
+                            // 等待 MAC 确认（最多 500ms）
+                            var waitCount = 10
+                            while (macAddress.isEmpty() && waitCount-- > 0) {
+                                Thread.sleep(50)
+                            }
+
+                            if (deviceId.equals(macAddress, ignoreCase = true)) {
+                                Log.i(TAG, "OPPO headset clicked, opening HeyTap")
+                                sendLog("点击 OPPO 耳机卡片，打开欢律")
+
                                 val intent = Intent().apply {
-                                    putExtra("mac", macAddress)
-                                    putExtra("left", leftBattery)
-                                    putExtra("right", rightBattery)
-                                    putExtra("box", boxBattery)
-                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                                     setClassName(Constants.PKG_NAME_HEYTAP, "com.heytap.headset.ui.MainActivity")
+                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                                 }
 
                                 try {
                                     context.startActivity(intent)
-                                    Log.i(TAG, "Successfully started HeyTap activity")
-                                    // 只有成功启动后才阻止默认行为
+                                    hidePanel()
                                     param.result = null
                                 } catch (e: Throwable) {
-                                    Log.w(TAG, "Failed to start HeyTap activity: ${e.message}, falling back to default")
-                                    // 失败时不设置 result，让默认行为继续
+                                    Log.w(TAG, "Failed to start HeyTap: ${e.message}")
                                 }
                             }
                         } catch (e: Throwable) {
-                            // 发生任何异常都不要影响原有功能
-                            XposedBridge.log("$TAG: Error in performClicked hook (non-fatal): ${e.message}")
+                            XposedBridge.log("$TAG: Error in performClicked: ${e.message}")
                         }
                     }
                 }
             )
 
             Log.i(TAG, "DeviceInfoWrapper.performClicked hooked")
+            sendLog("成功 Hook DeviceInfoWrapper")
         } catch (e: Throwable) {
             XposedBridge.log("$TAG: Failed to hook DeviceInfoWrapper: ${e.message}")
+            sendLog("Hook DeviceInfoWrapper 失败: ${e.message}")
         }
     }
 
     /**
-     * 隐藏控制中心面板
+     * 请求 MAC 地址确认
      */
-    private fun hideControlPanel() {
-        try {
-            val panelControllerClass = pluginClassLoader?.loadClass(
-                "miui.systemui.controlcenter.panel.main.MainPanelController"
-            )
-            // 尝试调用 exitOrHide 方法
-            // 注意：这需要获取到 panelController 实例，可能需要额外的 hook
-        } catch (e: Throwable) {
-            Log.w(TAG, "Failed to hide control panel: ${e.message}")
+    private fun requestMacConfirmation(context: Context) {
+        Intent(Constants.Action.OPPO_GET_MAC).apply {
+            `package` = Constants.PKG_NAME_BLUETOOTH
+            addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
+            context.sendBroadcast(this)
         }
     }
 
     /**
-     * 注册电量广播接收器
+     * 注册广播接收器
      */
-    private fun registerBatteryReceiver(context: Context) {
-        val handlerThread = HandlerThread("oppo_battery_receiver").apply { start() }
+    private fun registerReceivers(context: Context) {
+        val handlerThread = HandlerThread("oppo_systemui_receiver").apply { start() }
         val handler = Handler(handlerThread.looper)
 
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context?, intent: Intent?) {
-                when (intent?.action) {
+                intent ?: return
+
+                when (intent.action) {
                     Constants.Action.OPPO_BATTERY_UPDATE -> {
                         leftBattery = intent.getIntExtra("left", -1)
                         rightBattery = intent.getIntExtra("right", -1)
                         boxBattery = intent.getIntExtra("box", -1)
                         macAddress = intent.getStringExtra("mac") ?: ""
+                        deviceName = intent.getStringExtra("name") ?: ""
                         isOppoHeadsetConnected = leftBattery >= 0 || rightBattery >= 0
 
-                        Log.d(TAG, "OPPO battery update: L=$leftBattery R=$rightBattery B=$boxBattery MAC=$macAddress")
+                        Log.d(TAG, "Battery update: L=$leftBattery R=$rightBattery B=$boxBattery MAC=$macAddress")
+                        sendLog("电量更新: L=$leftBattery R=$rightBattery B=$boxBattery")
+                    }
 
-                        // 通知回调
-                        onBatteryUpdate?.invoke(leftBattery, rightBattery, boxBattery, macAddress)
+                    Constants.Action.OPPO_CONNECTION_STATE -> {
+                        val connected = intent.getBooleanExtra("connected", false)
+                        macAddress = intent.getStringExtra("mac") ?: ""
+                        deviceName = intent.getStringExtra("name") ?: ""
+                        isOppoHeadsetConnected = connected
+
+                        Log.d(TAG, "Connection state: connected=$connected, mac=$macAddress")
+                        sendLog("连接状态: ${if (connected) "已连接" else "已断开"} $deviceName")
+
+                        if (!connected) {
+                            leftBattery = -1
+                            rightBattery = -1
+                            boxBattery = -1
+                        }
+                    }
+
+                    Constants.Action.OPPO_MAC_RECEIVED -> {
+                        macAddress = intent.getStringExtra("mac") ?: ""
+                        deviceName = intent.getStringExtra("name") ?: ""
+                        Log.d(TAG, "MAC received: $macAddress")
                     }
                 }
             }
         }
 
-        val filter = IntentFilter(Constants.Action.OPPO_BATTERY_UPDATE)
+        val filter = IntentFilter().apply {
+            addAction(Constants.Action.OPPO_BATTERY_UPDATE)
+            addAction(Constants.Action.OPPO_CONNECTION_STATE)
+            addAction(Constants.Action.OPPO_MAC_RECEIVED)
+        }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             context.registerReceiver(receiver, filter, null, handler, Context.RECEIVER_EXPORTED)
         } else {
             context.registerReceiver(receiver, filter, null, handler)
         }
 
-        Log.i(TAG, "Battery receiver registered in SystemUI")
+        Log.i(TAG, "Receivers registered in SystemUI")
+        sendLog("广播接收器已注册")
     }
 
     /**
-     * 发送降噪模式切换指令
+     * 发送日志到主界面
      */
-    fun switchAncMode(mode: Int) {
-        val context = systemUIContext
-        if (context == null) {
-            Log.w(TAG, "SystemUI context is null")
-            return
+    private fun sendLog(message: String) {
+        try {
+            val context = systemUIContext ?: return
+            Intent(Constants.Action.OPPO_LOG).apply {
+                putExtra("log", "[UI] $message")
+                putExtra("time", System.currentTimeMillis())
+                context.sendBroadcast(this)
+            }
+        } catch (e: Throwable) {
+            // 忽略
         }
-
-        if (macAddress.isEmpty()) {
-            Log.w(TAG, "MAC address is empty")
-            return
-        }
-
-        Intent(Constants.Action.OPPO_ACTION_SWITCH_MODE).apply {
-            putExtra("mode", mode)
-            putExtra("mac", macAddress)
-            addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
-            `package` = Constants.PKG_NAME_HEYTAP
-            context.sendBroadcast(this)
-        }
-
-        Log.i(TAG, "Sent ANC mode switch: $mode to $macAddress")
     }
 }
